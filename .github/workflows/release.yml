@@ -1,0 +1,211 @@
+# Builds the HADI phone app from the private source repo (hey-hadi/Hadi) on this PUBLIC repo's free
+# runners, Mac included:
+#   - Android: an APK, published as a release here (releases/latest/download/HADI.apk is always the
+#     newest);
+#   - iOS: an App Store build, uploaded straight to TestFlight.
+# Builds run with EAS's own build tools on these runners (`eas build --local`), which don't count
+# against the Expo plan's build limit. Signing keys and build numbers still come from EAS, so a
+# build here is the same as one in Expo's cloud.
+#
+# Canonical copy: hey-hadi/Hadi → hadi-mobile/releases-repo/. Edit it there, then copy it here.
+#
+# Started by hey-hadi/Hadi's "Mobile release" workflow (a repository_dispatch on every push to main
+# that changes the phone app), or by hand: Actions → Build HADI mobile → Run workflow.
+#
+# Secrets (Settings → Secrets and variables → Actions → New repository secret):
+#   HADI_SOURCE_TOKEN  required: fine-grained token, resource owner hey-hadi, repository Hadi,
+#                      Contents: Read-only (the desktop releases repo's works)
+#   EXPO_TOKEN         required: expo.dev → Account settings → Access tokens (for the signing keys)
+#   ASC_KEY_ID         iOS upload: App Store Connect → Users and Access → Integrations → App Store
+#   ASC_ISSUER_ID        Connect API → a key with the App Manager role: its Key ID, the Issuer ID,
+#   ASC_KEY_P8           and the downloaded AuthKey_XXXX.p8 file's whole text
+# Without the three ASC secrets the iOS job stops before building (an App Store build is never kept
+# here: this repo is public).
+#
+# The source is fetched as a tarball through the API (never git), so no commit message from the
+# private repo appears in this public repo's logs or releases.
+
+name: Build HADI mobile
+
+on:
+  repository_dispatch:
+    types: [mobile-release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of hey-hadi/Hadi to build
+        required: false
+        default: main
+      platforms:
+        description: What to build
+        required: false
+        default: both
+        type: choice
+        options: [both, android, ios]
+
+# One build at a time; if several pile up, only the newest waits, so the latest commit always ships.
+concurrency:
+  group: hadi-mobile-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: hey-hadi/Hadi
+  NODE_VERSION: "22.x"
+  EAS_CLI: eas-cli@25.2.0
+
+jobs:
+  prepare:
+    name: Pick the commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      android: ${{ steps.pick.outputs.android }}
+      ios: ${{ steps.pick.outputs.ios }}
+    steps:
+      - name: Check the required secrets are set
+        env:
+          HAS_SOURCE: ${{ secrets.HADI_SOURCE_TOKEN != '' }}
+          HAS_EXPO: ${{ secrets.EXPO_TOKEN != '' }}
+        run: |
+          missing=0
+          if [ "$HAS_SOURCE" != "true" ]; then
+            echo "::error title=Missing secret::Add HADI_SOURCE_TOKEN (a fine-grained token with read access to hey-hadi/Hadi's contents) in Settings → Secrets and variables → Actions."
+            missing=1
+          fi
+          if [ "$HAS_EXPO" != "true" ]; then
+            echo "::error title=Missing secret::Add EXPO_TOKEN (expo.dev → Account settings → Access tokens) in Settings → Secrets and variables → Actions."
+            missing=1
+          fi
+          exit $missing
+
+      # The ref is resolved now, when this run starts, so the newest run always builds the newest
+      # commit.
+      - name: Pin the commit and the platforms
+        id: pick
+        env:
+          TOKEN: ${{ secrets.HADI_SOURCE_TOKEN }}
+          REF: ${{ github.event.client_payload.ref || inputs.ref || 'main' }}
+          PLATFORMS: ${{ github.event.client_payload.platforms || inputs.platforms || 'both' }}
+        run: |
+          set -euo pipefail
+          sha=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.sha" \
+            "https://api.github.com/repos/$SOURCE_REPO/commits/$REF")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "android=$([ "$PLATFORMS" = ios ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+          echo "ios=$([ "$PLATFORMS" = android ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+          echo "Building \`${sha:0:8}\` ($PLATFORMS)" >> "$GITHUB_STEP_SUMMARY"
+
+  android:
+    name: Android APK
+    needs: prepare
+    if: needs.prepare.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # publishes the release
+    steps:
+      - name: Fetch the source
+        env:
+          TOKEN: ${{ secrets.HADI_SOURCE_TOKEN }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/src"
+          curl -fsSL -H "Authorization: Bearer $TOKEN" "https://api.github.com/repos/$SOURCE_REPO/tarball/$SHA" \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/src"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the app's packages
+        working-directory: ${{ runner.temp }}/src/hadi-mobile
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the APK
+        working-directory: ${{ runner.temp }}/src/hadi-mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_NO_VCS: "1"
+          EAS_PROJECT_ROOT: ${{ runner.temp }}/src/hadi-mobile
+        run: npx --yes "$EAS_CLI" build --platform android --profile apk --local --non-interactive --output "$RUNNER_TEMP/HADI.apk"
+
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="android-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" "$RUNNER_TEMP/HADI.apk" --repo "$GITHUB_REPOSITORY" --latest \
+            --title "HADI for Android · build ${GITHUB_RUN_NUMBER}" \
+            --notes "Built from \`${SHA:0:8}\`. Install it on an Android phone: open this page there and tap HADI.apk."
+          echo "APK: https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/HADI.apk" >> "$GITHUB_STEP_SUMMARY"
+
+  ios:
+    name: iOS to TestFlight
+    needs: prepare
+    if: needs.prepare.outputs.ios == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check the App Store Connect key is set
+        env:
+          HAS_KEY: ${{ secrets.ASC_KEY_ID != '' && secrets.ASC_ISSUER_ID != '' && secrets.ASC_KEY_P8 != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error title=Missing secret::Add ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 (an App Store Connect API key with the App Manager role) to upload to TestFlight."
+            exit 1
+          fi
+
+      - name: Fetch the source
+        env:
+          TOKEN: ${{ secrets.HADI_SOURCE_TOKEN }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/src"
+          curl -fsSL -H "Authorization: Bearer $TOKEN" "https://api.github.com/repos/$SOURCE_REPO/tarball/$SHA" \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/src"
+
+      # The App Store takes only builds from a current Xcode.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install the app's packages
+        working-directory: ${{ runner.temp }}/src/hadi-mobile
+        run: npm ci --no-audit --no-fund
+
+      - name: Build for the App Store
+        working-directory: ${{ runner.temp }}/src/hadi-mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EAS_NO_VCS: "1"
+          EAS_PROJECT_ROOT: ${{ runner.temp }}/src/hadi-mobile
+        run: npx --yes "$EAS_CLI" build --platform ios --profile production --local --non-interactive --output "$RUNNER_TEMP/HADI.ipa"
+
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s\n' "$ASC_KEY_P8" > "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          xcrun altool --upload-app --type ios --file "$RUNNER_TEMP/HADI.ipa" --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          echo "Uploaded to TestFlight. It shows there once Apple has processed it (usually 5-15 minutes)." >> "$GITHUB_STEP_SUMMARY"
